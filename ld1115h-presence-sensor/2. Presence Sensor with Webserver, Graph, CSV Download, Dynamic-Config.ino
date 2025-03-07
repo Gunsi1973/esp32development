@@ -9,8 +9,7 @@ const char* password = "xxx";
 int sensor_th1 = 130;         // Motion Detection Sensitivity
 int sensor_th2 = 250;         // Presence Detection Sensitivity
 int sensor_th_in = 300;       // Internal threshold (unknown purpose)
-int sensor_output_mode = 0;   // Output Mode (0 = standard ASCII text output)
-int sensor_tons = 30;         // Output Hold Time
+int sensor_tons = 30;         // Output Hold Time (in seconds, now 0 to 180)
 int sensor_utons = 100;       // Output Release Time
 int rawOutputEnabled = 1;     // 1 = enable raw output to Serial monitor, 0 = disable
 
@@ -25,10 +24,10 @@ unsigned long last_movement_time = 0;
 unsigned long clear_time = 2000;  // 2 seconds until "No movement detected" is set
 
 // Global buffers for monitoring
-String rawLog = "";      // Rolling log of raw sensor output
+String rawLog = "";       // Rolling log of raw sensor output (newest on top)
 String sensorConfig = ""; // Latest sensor configuration output
 
-// Forward declaration
+// Forward declaration of main page HTML
 String getWebPage();
 
 // Function to interpret sensor mode based on the provided value
@@ -45,7 +44,8 @@ String interpretMode(int mode) {
   }
 }
 
-// Function to send sensor configuration commands over serial
+// Function to send sensor configuration commands over serial,
+// then saves the configuration and requests the sensor to output all current settings.
 void configureSensor() {
   String cmd;
   
@@ -58,10 +58,6 @@ void configureSensor() {
   delay(50);
   
   cmd = "th_in=" + String(sensor_th_in);
-  LD1115H_Serial.println(cmd);
-  delay(50);
-  
-  cmd = "output_mode=" + String(sensor_output_mode);
   LD1115H_Serial.println(cmd);
   delay(50);
   
@@ -110,7 +106,7 @@ void setup() {
     server.send(200, "text/plain", sensorData);
   });
   
-  // Endpoint for dynamic configuration via AJAX
+  // Endpoint for configuration updates via the "Apply" button
   server.on("/config", []() {
     if (server.hasArg("submit")) {
       if (server.hasArg("th1")) {
@@ -128,9 +124,6 @@ void setup() {
       if (server.hasArg("utons")) {
         sensor_utons = server.arg("utons").toInt();
       }
-      if (server.hasArg("output_mode")) {
-        sensor_output_mode = server.arg("output_mode").toInt();
-      }
       if (server.hasArg("rawOutput")) {
         rawOutputEnabled = server.arg("rawOutput").toInt();
       }
@@ -143,7 +136,6 @@ void setup() {
       Serial.print("th1: "); Serial.println(sensor_th1);
       Serial.print("th2: "); Serial.println(sensor_th2);
       Serial.print("th_in: "); Serial.println(sensor_th_in);
-      Serial.print("output_mode: "); Serial.println(sensor_output_mode);
       Serial.print("tons: "); Serial.println(sensor_tons);
       Serial.print("utons: "); Serial.println(sensor_utons);
       Serial.print("Raw output: "); Serial.println(rawOutputEnabled ? "Enabled" : "Disabled");
@@ -154,10 +146,18 @@ void setup() {
     }
   });
   
-  // Endpoint to serve monitoring information (raw log and sensor config)
+  // Endpoint to read sensor configuration when the user presses "Read Sensor Config"
+  server.on("/read_config", []() {
+    // Request sensor configuration output
+    LD1115H_Serial.println("get_all");
+    delay(100);
+    server.send(200, "text/html", sensorConfig);
+  });
+  
+  // Endpoint for monitoring data (raw sensor output and current sensor configuration)
   server.on("/monitor", []() {
-    String monitorHTML = "<h3>Raw Sensor Data:</h3><pre>" + rawLog + "</pre>"
-                         "<h3>Sensor Configuration:</h3><pre>" + sensorConfig + "</pre>";
+    String monitorHTML = "<h3>Sensor Configuration:</h3><pre>" + sensorConfig + "</pre>"
+                         "<h3>Raw Sensor Data (newest on top):</h3><pre>" + rawLog + "</pre>";
     server.send(200, "text/html", monitorHTML);
   });
   
@@ -170,10 +170,14 @@ void loop() {
     String rawData = LD1115H_Serial.readStringUntil('\n');
     rawData.trim();
     
-    // Append to the rolling raw log (limit to last ~2000 characters)
-    rawLog += rawData + "\n";
+    // Prepend a timestamp (seconds since boot) to each raw sensor line
+    String timeStamp = "[" + String(millis()/1000) + "s] ";
+    String logEntry = timeStamp + rawData + "\n";
+    // Prepend new log entries so that newest is on top
+    rawLog = logEntry + rawLog;
+    // Limit the rawLog size (approx. 2000 characters)
     if (rawLog.length() > 2000) {
-      rawLog = rawLog.substring(rawLog.length() - 2000);
+      rawLog = rawLog.substring(0, 2000);
     }
     
     // Optionally print raw sensor output to Serial monitor
@@ -181,13 +185,11 @@ void loop() {
       Serial.println("Raw sensor output: " + rawData);
     }
     
-    // Check if the line appears to be part of the sensor configuration output.
+    // Check if the line is part of the sensor configuration output
     if (rawData.startsWith("th1=")) {
-      // Start a new configuration block
       sensorConfig = rawData + "\n";
     } else if (rawData.startsWith("th2=") || rawData.startsWith("th_in=") ||
-               rawData.startsWith("output_mode=") || rawData.startsWith("tons=") ||
-               rawData.startsWith("utons=")) {
+               rawData.startsWith("tons=") || rawData.startsWith("utons=")) {
       sensorConfig += rawData + "\n";
     }
     
@@ -220,7 +222,7 @@ void loop() {
     }
   }
 
-  // Update sensorData to "No movement detected" if clear_time has passed.
+  // If no movement is detected within clear_time, update sensorData accordingly
   if (millis() - last_movement_time > clear_time) {
     if (sensorData != "🔻 No movement detected.") {
       sensorData = "🔻 No movement detected.";
@@ -230,7 +232,7 @@ void loop() {
   server.handleClient();
 }
 
-// Main page: header, main configuration/graph area, and monitoring window.
+// Main webpage: header, main area with configuration controls and graph, and monitoring window.
 String getWebPage() {
   String page = R"rawliteral(
 <!DOCTYPE html>
@@ -267,10 +269,25 @@ String getWebPage() {
       box-sizing: border-box;
       overflow-y: auto;
     }
-    #graph {
+    #graphArea {
       flex-grow: 1;
       padding: 10px;
       box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+    }
+    #chartContainer {
+      flex-grow: 1;
+      position: relative;
+    }
+    #configDisplay {
+      height: 20%;
+      overflow-y: auto;
+      border: 1px solid #ccc;
+      margin-top: 5px;
+      padding: 5px;
+      font-size: 0.9em;
+      background: #f9f9f9;
     }
     #monitor {
       height: 30vh;
@@ -279,6 +296,7 @@ String getWebPage() {
       overflow-y: auto;
       padding: 10px;
       box-sizing: border-box;
+      font-size: 0.9em;
     }
     h1 { color: #007BFF; }
     h2 { font-size: 1.2em; }
@@ -287,6 +305,7 @@ String getWebPage() {
     input[type=range] { width: 100%; }
     select { width: 100%; padding: 5px; }
     #status { color: green; margin-top: 10px; text-align: center; }
+    button { padding: 5px 10px; margin-top: 10px; }
   </style>
 </head>
 <body>
@@ -303,7 +322,7 @@ String getWebPage() {
   page += R"rawliteral(</span></label>
         <input type="range" id="th1" name="th1" min="0" max="1000" value=")rawliteral";
   page += String(sensor_th1);
-  page += R"rawliteral(" oninput="document.getElementById('th1Val').innerText = this.value; updateConfig();">
+  page += R"rawliteral(" oninput="document.getElementById('th1Val').innerText = this.value;">
       </div>
       <div class="control">
         <label for="th2">Presence Sensitivity (th2): <span id="th2Val">)rawliteral";
@@ -311,7 +330,7 @@ String getWebPage() {
   page += R"rawliteral(</span></label>
         <input type="range" id="th2" name="th2" min="0" max="1000" value=")rawliteral";
   page += String(sensor_th2);
-  page += R"rawliteral(" oninput="document.getElementById('th2Val').innerText = this.value; updateConfig();">
+  page += R"rawliteral(" oninput="document.getElementById('th2Val').innerText = this.value;">
       </div>
       <div class="control">
         <label for="th_in">Internal Threshold (th_in): <span id="th_inVal">)rawliteral";
@@ -319,15 +338,15 @@ String getWebPage() {
   page += R"rawliteral(</span></label>
         <input type="range" id="th_in" name="th_in" min="0" max="1000" value=")rawliteral";
   page += String(sensor_th_in);
-  page += R"rawliteral(" oninput="document.getElementById('th_inVal').innerText = this.value; updateConfig();">
+  page += R"rawliteral(" oninput="document.getElementById('th_inVal').innerText = this.value;">
       </div>
       <div class="control">
-        <label for="tons">Output Hold Time (tons): <span id="tonsVal">)rawliteral";
+        <label for="tons">Output Hold Time (tons) [sec]: <span id="tonsVal">)rawliteral";
   page += String(sensor_tons);
   page += R"rawliteral(</span></label>
-        <input type="range" id="tons" name="tons" min="0" max="1000" value=")rawliteral";
+        <input type="range" id="tons" name="tons" min="0" max="180" value=")rawliteral";
   page += String(sensor_tons);
-  page += R"rawliteral(" oninput="document.getElementById('tonsVal').innerText = this.value; updateConfig();">
+  page += R"rawliteral(" oninput="document.getElementById('tonsVal').innerText = this.value;">
       </div>
       <div class="control">
         <label for="utons">Output Release Time (utons): <span id="utonsVal">)rawliteral";
@@ -335,22 +354,11 @@ String getWebPage() {
   page += R"rawliteral(</span></label>
         <input type="range" id="utons" name="utons" min="0" max="1000" value=")rawliteral";
   page += String(sensor_utons);
-  page += R"rawliteral(" oninput="document.getElementById('utonsVal').innerText = this.value; updateConfig();">
-      </div>
-      <div class="control">
-        <label for="output_mode">Output Mode:</label>
-        <select id="output_mode" name="output_mode" onchange="updateConfig();">
-          <option value="0" )rawliteral";
-  if(sensor_output_mode == 0) page += "selected";
-  page += R"rawliteral(>Standard ASCII (0)</option>
-          <option value="1" )rawliteral";
-  if(sensor_output_mode == 1) page += "selected";
-  page += R"rawliteral(>Mode 1 (1)</option>
-        </select>
+  page += R"rawliteral(" oninput="document.getElementById('utonsVal').innerText = this.value;">
       </div>
       <div class="control">
         <label for="rawOutput">Raw Output to Serial:</label>
-        <select id="rawOutput" name="rawOutput" onchange="updateConfig();">
+        <select id="rawOutput" name="rawOutput">
           <option value="1" )rawliteral";
   if(rawOutputEnabled == 1) page += "selected";
   page += R"rawliteral(>Enable</option>
@@ -359,29 +367,33 @@ String getWebPage() {
   page += R"rawliteral(>Disable</option>
         </select>
       </div>
+      <button onclick="applyConfig()">Apply Configuration</button>
       <div id="status"></div>
     </div>
-    <div id="graph">
-      <canvas id="chart"></canvas>
+    <div id="graphArea">
+      <div id="chartContainer">
+        <canvas id="chart"></canvas>
+      </div>
+      <button onclick="readSensorConfig()">Read Sensor Config</button>
+      <div id="configDisplay">Sensor config will appear here...</div>
     </div>
   </div>
   <div id="monitor">
-    <h2>Monitoring</h2>
+    <h2>Monitoring (Newest on Top)</h2>
     <div id="monitorContent">
       Loading monitoring data...
     </div>
   </div>
   <script>
-    // Update configuration via AJAX request to /config
-    function updateConfig() {
+    // Function to apply configuration when "Apply Configuration" button is pressed
+    function applyConfig() {
       let th1 = document.getElementById('th1').value;
       let th2 = document.getElementById('th2').value;
       let th_in = document.getElementById('th_in').value;
       let tons = document.getElementById('tons').value;
       let utons = document.getElementById('utons').value;
-      let output_mode = document.getElementById('output_mode').value;
       let rawOutput = document.getElementById('rawOutput').value;
-      let url = `/config?submit=true&th1=${th1}&th2=${th2}&th_in=${th_in}&tons=${tons}&utons=${utons}&output_mode=${output_mode}&rawOutput=${rawOutput}`;
+      let url = `/config?submit=true&th1=${th1}&th2=${th2}&th_in=${th_in}&tons=${tons}&utons=${utons}&rawOutput=${rawOutput}`;
       fetch(url)
         .then(response => response.text())
         .then(data => {
@@ -389,6 +401,16 @@ String getWebPage() {
           setTimeout(() => { document.getElementById('status').innerHTML = ""; }, 2000);
         })
         .catch(err => console.error("Error updating config", err));
+    }
+    
+    // Function to read sensor configuration when "Read Sensor Config" is pressed
+    function readSensorConfig() {
+      fetch('/read_config')
+        .then(response => response.text())
+        .then(data => {
+          document.getElementById('configDisplay').innerHTML = "<pre>" + data + "</pre>";
+        })
+        .catch(err => console.error("Error reading sensor config", err));
     }
     
     // Chart and live data handling
