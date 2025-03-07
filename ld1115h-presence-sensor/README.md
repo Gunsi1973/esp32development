@@ -1,5 +1,8 @@
 # LD1115H Presence & Motion Detection with ESP32
 
+See this link for ESPHome and Homeassistant
+https://github.com/patrick3399/Hi-Link_mmWave_Radar_ESPHome
+
 ## Overview
 This project integrates the **LD1115H Mini 24G Human Presence Sensor** with an **ESP32**, using UART communication to read motion and presence detection data. The code filters noisy data, improves real-time detection, and introduces configurable thresholds for movement and presence sensitivity.
 
