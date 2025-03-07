@@ -24,7 +24,11 @@ String sensorData = "Waiting for data...";
 unsigned long last_movement_time = 0;
 unsigned long clear_time = 2000;  // 2 seconds until "No movement detected" is set
 
-// Forward declarations
+// Global buffers for monitoring
+String rawLog = "";      // Rolling log of raw sensor output
+String sensorConfig = ""; // Latest sensor configuration output
+
+// Forward declaration
 String getWebPage();
 
 // Function to interpret sensor mode based on the provided value
@@ -69,9 +73,13 @@ void configureSensor() {
   LD1115H_Serial.println(cmd);
   delay(50);
   
-  // Optionally, send "save" if your sensor supports saving parameters.
-  // LD1115H_Serial.println("save");
-  // delay(50);
+  // Save the parameters so they persist after power-down
+  LD1115H_Serial.println("save");
+  delay(50);
+  
+  // Request the current configuration from the sensor
+  LD1115H_Serial.println("get_all");
+  delay(50);
 }
 
 void setup() {
@@ -102,10 +110,9 @@ void setup() {
     server.send(200, "text/plain", sensorData);
   });
   
-  // Endpoint for dynamic configuration (AJAX calls from the main page)
+  // Endpoint for dynamic configuration via AJAX
   server.on("/config", []() {
     if (server.hasArg("submit")) {
-      // Update parameters from the GET request values
       if (server.hasArg("th1")) {
         sensor_th1 = server.arg("th1").toInt();
       }
@@ -131,7 +138,7 @@ void setup() {
       // Re-configure sensor with the new parameters
       configureSensor();
       
-      // Log updated parameters to the Serial monitor (if raw output is enabled)
+      // Log updated parameters to Serial monitor
       Serial.println("Sensor parameters updated:");
       Serial.print("th1: "); Serial.println(sensor_th1);
       Serial.print("th2: "); Serial.println(sensor_th2);
@@ -147,19 +154,44 @@ void setup() {
     }
   });
   
+  // Endpoint to serve monitoring information (raw log and sensor config)
+  server.on("/monitor", []() {
+    String monitorHTML = "<h3>Raw Sensor Data:</h3><pre>" + rawLog + "</pre>"
+                         "<h3>Sensor Configuration:</h3><pre>" + sensorConfig + "</pre>";
+    server.send(200, "text/html", monitorHTML);
+  });
+  
   server.begin();
 }
 
 void loop() {
-  // Read sensor data from serial and optionally print the raw data to the Serial monitor
+  // Read sensor data from serial and process it
   if (LD1115H_Serial.available()) {
     String rawData = LD1115H_Serial.readStringUntil('\n');
     rawData.trim();
     
+    // Append to the rolling raw log (limit to last ~2000 characters)
+    rawLog += rawData + "\n";
+    if (rawLog.length() > 2000) {
+      rawLog = rawLog.substring(rawLog.length() - 2000);
+    }
+    
+    // Optionally print raw sensor output to Serial monitor
     if (rawOutputEnabled) {
       Serial.println("Raw sensor output: " + rawData);
     }
     
+    // Check if the line appears to be part of the sensor configuration output.
+    if (rawData.startsWith("th1=")) {
+      // Start a new configuration block
+      sensorConfig = rawData + "\n";
+    } else if (rawData.startsWith("th2=") || rawData.startsWith("th_in=") ||
+               rawData.startsWith("output_mode=") || rawData.startsWith("tons=") ||
+               rawData.startsWith("utons=")) {
+      sensorConfig += rawData + "\n";
+    }
+    
+    // Process detection messages (e.g. "mov, ..." or "occ, ...")
     if (rawData.length() > 0) {
       int firstComma = rawData.indexOf(',');
       int spaceAfterMode = rawData.indexOf(' ', firstComma + 2);
@@ -188,7 +220,7 @@ void loop() {
     }
   }
 
-  // If no movement is detected within clear_time, update sensorData accordingly
+  // Update sensorData to "No movement detected" if clear_time has passed.
   if (millis() - last_movement_time > clear_time) {
     if (sensorData != "🔻 No movement detected.") {
       sensorData = "🔻 No movement detected.";
@@ -198,7 +230,7 @@ void loop() {
   server.handleClient();
 }
 
-// Integrated main page: header with sensor data, left configuration panel, and right live graph.
+// Main page: header, main configuration/graph area, and monitoring window.
 String getWebPage() {
   String page = R"rawliteral(
 <!DOCTYPE html>
@@ -211,20 +243,22 @@ String getWebPage() {
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@1.2.1"></script>
   <style>
     html, body {
-      height: 100%;
+      height: 100vh;
       margin: 0;
       font-family: Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
     }
     #header {
-      height: 20%;
+      height: 20vh;
       background: #f0f0f0;
       text-align: center;
       padding: 10px;
       box-sizing: border-box;
     }
-    #container {
+    #main {
+      height: 50vh;
       display: flex;
-      height: 80%;
     }
     #controls {
       width: 20%;
@@ -235,6 +269,14 @@ String getWebPage() {
     }
     #graph {
       flex-grow: 1;
+      padding: 10px;
+      box-sizing: border-box;
+    }
+    #monitor {
+      height: 30vh;
+      background: #fff;
+      border-top: 1px solid #ccc;
+      overflow-y: auto;
       padding: 10px;
       box-sizing: border-box;
     }
@@ -252,7 +294,7 @@ String getWebPage() {
     <h1>ESP32 Sensor Monitor</h1>
     <p id="data">Waiting for data...</p>
   </div>
-  <div id="container">
+  <div id="main">
     <div id="controls">
       <h2>Configuration</h2>
       <div class="control">
@@ -323,6 +365,12 @@ String getWebPage() {
       <canvas id="chart"></canvas>
     </div>
   </div>
+  <div id="monitor">
+    <h2>Monitoring</h2>
+    <div id="monitorContent">
+      Loading monitoring data...
+    </div>
+  </div>
   <script>
     // Update configuration via AJAX request to /config
     function updateConfig() {
@@ -386,6 +434,16 @@ String getWebPage() {
         .catch(error => console.error("Error fetching data:", error));
     }
     
+    // Update monitoring section via AJAX request to /monitor every 2 seconds
+    function updateMonitor() {
+      fetch('/monitor')
+        .then(response => response.text())
+        .then(data => {
+          document.getElementById('monitorContent').innerHTML = data;
+        })
+        .catch(err => console.error("Error fetching monitor data", err));
+    }
+    
     window.onload = function() {
       let ctx = document.getElementById('chart').getContext('2d');
       chart = new Chart(ctx, {
@@ -431,6 +489,7 @@ String getWebPage() {
         }
       });
       setInterval(updateData, 1000);
+      setInterval(updateMonitor, 2000);
     };
   </script>
 </body>
